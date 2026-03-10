@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ChromaDB
+faq_database/
+*.sqlite3
+
+# Not published files
+hidden/
+
+# Models
+*.safetensors
+*.bin
+my_model/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# wandb
+wandb/
+
+# Ignore certificates
+*.pem
+*.cert
+*.key
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+
+PROJEKT.md
+
