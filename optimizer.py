@@ -1,105 +1,23 @@
-import os
+# optimizer.py
+import re
 import json
-import math
-from openai import OpenAI
 from datetime import datetime
-from dotenv import load_dotenv
 
-# Helper function to calculate word count score
-def word_count_factor(word_count: int, target: int = 150) -> float:
-    """
-    Returns a multiplier between 0 and 1.
-    At target words: score = 1.0 (no penalty).
-    Deviation gets penalized exponentially (Gaussian curve).
+from config import client, MODEL, MAX_TOKENS_BRONZE, MAX_TOKENS_SILVER, TASK, TEST_INPUT, CRITERIA, PROMPT_VARIANTS
+from scoring import calculate_final_score
 
-    Examples with k=3:
-      150 words → 1.00  (perfect)
-      120 words → 0.96  (minimal penalty)
-      180 words → 0.96  (minimal penalty)
-      225 words → 0.78  (noticeable penalty, 50% over)
-       75 words → 0.78  (noticeable penalty, 50% under)
-      300 words → 0.37  (heavy penalty, 100% over)
-    """
-    k = 3                                          # controls penalty steepness, not too strict for now
-    relative_deviation = (word_count - target) / target   # e.g. 0.2 = 20% off
-    factor = math.exp(-k * relative_deviation ** 2)       # Gaussian: symmetric, smooth
-    return round(factor, 4)
-
-# Load .env
-load_dotenv()
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# The task we're optimizing
-TASK = "Write a professional customer service response to a complaint."
-TEST_INPUT = "My package hasn't arrived in 2 weeks and nobody is responding to my emails. This is unacceptable!"
-
-# Evaluation criteria (for manual scoring in Bronze)
-CRITERIA = """
-Rate each category from 1-10:
-- Empathy: Shows understanding of the customer's frustration
-- Professionalism: Not too casual, not too stiff
-- Concreteness: Mentions specific next steps
-(Word count is tracked separately — target is under 150 words)
-"""
-
-# Different prompt variants to test
-PROMPT_VARIANTS = [
-    # Variant 1: Minimal
-    {
-        "name": "minimal",
-        "system": "You are a customer service representative.",
-        "template": "{task}\n\nCustomer inquiry: {input}"
-    },
-
-    # Variant 2: Detailed
-    {
-        "name": "detailed",
-        "system": "You are an experienced customer service representative at an e-commerce company. You always respond professionally, empathetically, and solution-oriented.",
-        "template": "Task: {task}\n\nCustomer inquiry:\n{input}\n\nWrite a response that acknowledges the problem and outlines concrete next steps."
-    },
-
-    # Variant 3: Persona
-    {
-        "name": "persona",
-        "system": "You are Sarah, Senior Customer Success Manager with 10 years of experience. You are known for calming down even the most frustrated customers.",
-        "template": "{task}\n\nThe customer writes:\n\"{input}\"\n\nRespond as Sarah."
-    },
-
-    # Variant 4: Structured
-    {
-        "name": "structured",
-        "system": "You are a customer service representative. Always structure your responses like this: 1) Show empathy, 2) Acknowledge the problem, 3) Solution/next steps, 4) Closing.",
-        "template": "{task}\n\nInput: {input}"
-    },
-
-    # Variant 5: Chain of Thought
-    {
-        "name": "cot",
-        "system": "You are a customer service representative.",
-        "template": """{task}
-
-        Customer inquiry: {input}
-        
-        Before you respond, consider:
-        1. What is the customer's core problem?
-        2. What emotion is the customer showing?
-        3. What would be the best next step?
-        
-        Then write your response (without showing your reasoning)."""
-    },
-]
 
 def run_prompt(variant: dict, task: str, input_text: str) -> str:
     """
-    Runs a prompt and return the response
+    Runs a prompt and returns the response.
+    Used to generate the test outputs
     """
 
     user_message = variant["template"].format(task=task, input=input_text)
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        max_tokens=500,
+        model=MODEL,
+        max_tokens=MAX_TOKENS_BRONZE,
         messages=[
             {"role": "system", "content": variant["system"]},
             {"role": "user", "content": user_message}
@@ -108,21 +26,19 @@ def run_prompt(variant: dict, task: str, input_text: str) -> str:
 
     return response.choices[0].message.content
 
-# Create a custom function to get user scores
+
 def get_manual_scores() -> dict:
-    """
-    Asks the user to score each category individually. Returns dict with scores and average.
-    """
+    """Asks the user to score each category individually."""
 
     categories = ["Empathy", "Professionalism", "Concreteness"]
     scores = {}
 
     for category in categories:
-        while True: # loop until broken with break -> so loops until valid input is given
+        while True:
             raw = input(f"  {category} (1-10): ").strip()
             try:
                 value = int(raw)
-                if 1 <= value <= 10: # Ensure valid range
+                if 1 <= value <= 10:
                     scores[category.lower()] = value
                     break
                 else:
@@ -132,17 +48,132 @@ def get_manual_scores() -> dict:
 
     return scores
 
+def evaluate_output_with_llm(output: str) -> dict:
+    """
+    Uses the LLM to score a customer service response.
+    Returns the same 3 keys as get_manual_scores(): empathy, professionalism, concreteness.
+    Word count is NOT evaluated here — it's measured programmatically in the main loop.
+    """
 
-def main():
+    eval_prompt = f"""Rate this customer service response on three categories, each from 1 to 10.
+
+    ANSWER TO BE RATED:
+    \"\"\"
+    {output}
+    \"\"\"
+    
+    CATEGORIES:
+    - empathy: Shows understanding of the customer's frustration
+    - professionalism: Appropriate tone — not too casual, not too stiff
+    - concreteness: Mentions specific next steps to resolve the issue
+    
+    Respond in this exact JSON format, nothing else:
+    {{
+        "empathy": <integer 1-10>,
+        "professionalism": <integer 1-10>,
+        "concreteness": <integer 1-10>,
+        "reasoning": "<1-2 sentences explaining the scores>"
+    }}
+    
+    """
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS_SILVER, # should be adjusted for short response, just JSON
+        messages=[
+            {"role": "user", "content": eval_prompt}
+        ]
+    )
+
+    text = response.choices[0].message.content  # extract response text
+
+    # Go through JSON response and extract
+    json_match = re.search(r'\{.*\}', text, re.DOTALL) # find JSON block in response
+
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            return {
+                "empathy": int(parsed.get("empathy", 5)),
+                "professionalism": int(parsed.get("professionalism", 5)),
+                "concreteness": int(parsed.get("concreteness", 5)),
+                "reasoning": parsed.get("reasoning", "")
+            }
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Fallback: if parsing fails, return neutral scores
+    print("  ⚠ Warning: Could not parse LLM evaluation, using defaults scores")
+    return {"empathy": 5, "professionalism": 5, "concreteness": 5, "reasoning": "Parse error"}
+
+
+def run_automated_experiment(variants: list, task: str, test_input: str, num_runs: int = 1) -> list:
+    """
+    Runs all variants and scores them via LLM.
+    num_runs > 1 = multiple runs per variant for statistical significance.
+    Uses the same scoring pipeline as Bronze (calculate_final_score).
+    """
+
+    all_results = []
+
+    for run_num in range(num_runs):
+        print(f"\n{'=' * 60}")
+        print(f"RUN {run_num + 1}/{num_runs}")
+        print(f"{'=' * 60}")
+
+        for idx, variant in enumerate(variants, 1):
+            print(f"\n  [{idx}/{len(variants)}] Testing: {variant['name']}...", end=" ")
+
+            # 1. Generate output -> same as Bronze
+            output = run_prompt(variant, task, test_input)
+            word_count = len(output.split())
+
+            # 2. Call LLM for scoring the 3 categories
+            evaluation = evaluate_output_with_llm(output)
+
+            # 3. Calculate final score (identical to Bronze pipeline)
+            scores = calculate_final_score(
+                evaluation["empathy"],
+                evaluation["professionalism"],
+                evaluation["concreteness"],
+                word_count
+            )
+
+            result = {
+                "run": run_num + 1,
+                "variant": variant["name"],
+                "system_prompt": variant["system"],
+                "template": variant["template"],
+                "output": output,
+                **scores,  # same keys as Bronze results
+                "reasoning": evaluation["reasoning"],  # LLM's explanation
+                "timestamp": datetime.now().isoformat()
+            }
+
+            all_results.append(result)
+            print(f"Score: {scores['total_score']}/10 "
+                  f"(E:{scores['empathy']} P:{scores['professionalism']} "
+                  f"C:{scores['concreteness']}) Words:{word_count}")
+
+    return all_results
+
+
+
+def main(mode="manual"):
     """
     Tests all prompt variants and collects results.
-    Flow: run each variant → collect manual scores → calculate final score → find winner
+    mode="manual": human scores each output (Bronze)
+    mode="llm": LLM scores each output (Silver)
     """
+
+    # Choose label and save path based on mode
+    tier = "BRONZE (Manual)" if mode == "manual" else "SILVER (Automated)"
+    save_path = "results/results_bronze.json" if mode == "manual" else "results/results_silver.json"
 
     results = []
 
     print("=" * 70)
-    print("PROMPT OPTIMIZER — BRONZE")
+    print(f"PROMPT OPTIMIZER — {tier}")
     print("=" * 70)
     print(f"\nTASK: {TASK}")
     print(f"Test Input: {TEST_INPUT[:50]}...")
@@ -153,46 +184,48 @@ def main():
         print(f"\n[{idx}/{len(PROMPT_VARIANTS)}] Testing: {variant['name']}")
         print("-" * 50)
 
-        # Run the prompt
         output = run_prompt(variant, TASK, TEST_INPUT)
         word_count = len(output.split())
 
         # Display output and metadata
         print(f"\nRole: {variant['system'][:60]}...")
         print(f"\nOutput:\n{output}")
-        print(f"\nWords count: {word_count} (Target: <=150)")
+        print(f"\nWord count: {word_count} (Target: <=150)")
 
-        # Manual scoring for Bronze
-        print(f"\n{CRITERIA}")
-        scores = get_manual_scores()
+        # === Switches modes based on mode parameter ===
 
-        # Calculate total score
-        # final_score = content quality * length compliance
-        # word_count_weight is 1.0 at 150 words, drops toward 0 for large deviations
-        content_score = (scores["empathy"] + scores["professionalism"] + scores["concreteness"]) / 3
-        word_count_weight = word_count_factor(word_count)
-        final_score = round(content_score * word_count_weight, 2)
+        if mode == "manual":
+            print(f"\n{CRITERIA}")
+            scores_raw = get_manual_scores()
+            reasoning = "Manual scoring" # Reasoning was added with LLM (LLM reason for score)
+        else:
+            scores_raw = evaluate_output_with_llm(output)
+            reasoning = scores_raw["reasoning"]
+            print(f"\n  LLM reasoning: {reasoning}")
+
+        # Calculate_final_score returns a dict with all scoring components
+        scores = calculate_final_score(
+            scores_raw["empathy"], scores_raw["professionalism"],
+            scores_raw["concreteness"], word_count
+        )
 
         results.append({
             "variant": variant["name"],
             "system_prompt": variant["system"],
             "template": variant["template"],
             "output": output,
-            "word_count": word_count,
-            "word_count_weight": round(word_count_weight, 2),
-            "empathy_score": scores["empathy"],
-            "professionalism_score": scores["professionalism"],
-            "concreteness_score": scores["concreteness"],
-            "total_score": final_score, # content avg * word_count_weight
+            **scores,  # unpacks: empathy, professionalism, concreteness, content_score, word_count, word_count_weight, total_score
+            "reasoning": reasoning,
+            "scoring_mode": mode,
             "timestamp": datetime.now().isoformat()
         })
 
-        print(f"✓ Saved: {variant['name']} = {final_score}/10 "
+        print(f"✓ Saved: {variant['name']} = {scores['total_score']}/10 "
               f"(E:{scores['empathy']} P:{scores['professionalism']} C:{scores['concreteness']})")
 
-    # Sort by average score, highest first
+    # Sort by total score, highest first
     results.sort(key=lambda x: x["total_score"], reverse=True)
-    winner = results[0] # assign winner to highest score
+    winner = results[0]
 
     print("\n" + "=" * 70)
     print("RESULTS")
@@ -200,29 +233,31 @@ def main():
 
     # Print results as visual bar chart
     for r in results:
-        bar_len = int(round(r["total_score"]))  # round for visual bar
+        bar_len = int(round(r["total_score"]))
         total_score = int(round(r["total_score"]))
         bar = "█" * bar_len + "░" * (10 - total_score)
-        print(f"  {r['variant']:15} [{bar}] {total_score}/10  "
-              f"(E:{r['empathy_score']} P:{r['professionalism_score']} C:{r['concreteness_score']}) "
-              f"Words:{r['word_count']}, Word Count Weight:{r['word_count_weight']}")
+        print(f"  {r['variant']:15} [{bar}] {r['total_score']}/10  "
+              f"(E:{r['empathy']} P:{r['professionalism']} C:{r['concreteness']}) "
+              f"Words:{r['word_count']}, WC Weight:{r['word_count_weight']}")
 
     print(f"\n🏆 WINNER: {winner['variant']} with {winner['total_score']}/10")
 
     # Save results
-    with open("results.json", "w") as f:
+    with open(save_path, "w") as f:
         json.dump({
             "task": TASK,
             "test_input": TEST_INPUT,
             "experiments": results,
             "winner": winner["variant"],
+            "scoring_mode": mode,
             "timestamp": datetime.now().isoformat()
         }, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✓ Results saved to results.json")
+    print(f"\n✓ Results saved to {save_path}")
 
     return results
 
 
 if __name__ == "__main__":
-    main()
+    # mode="manuel" = BRONZE, mode="llm" = SILVER
+    main(mode="llm")
