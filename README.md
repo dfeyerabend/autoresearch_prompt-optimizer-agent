@@ -32,7 +32,7 @@ Built as a self-directed project for the KI & Python module at Morphos GmbH.
 |---|---|---|
 | 🥉 Bronze | Test 5 fixed prompt variants with manual scoring, find winner | ✅ Done |
 | 🥈 Silver | Replace manual scoring with LLM-as-judge, automated evaluation loop | ✅ Done |
-| 🥇 Gold | Agent generates NEW variants based on learnings, iterative optimization | 🔄 In Progress |
+| 🥇 Gold | Agent generates NEW variants based on learnings, iterative optimization | ✅ Done |
 | 💎 Diamond | Meta-optimization — agent optimizes its own evaluator prompt | ⬜ Planned |
 
 ---
@@ -41,24 +41,30 @@ Built as a self-directed project for the KI & Python module at Morphos GmbH.
 
 ```
 auto-prompt-optimizer/
-├── config.py              # Constants, API client, prompt variants
-├── scoring.py             # word_count_factor (Gaussian), calculate_final_score
-├── optimizer.py           # Main workflow — Bronze & Silver via mode parameter
-├── prompts/
-│   └── variants.json      # (Gold) Agent-editable prompt variants
-├── instructions.md        # (Gold) Instructions for the optimizer agent
-├── results/
+├── config.py                # Constants, API client, prompt variants
+├── scoring.py               # word_count_factor (Gaussian), calculate_final_score
+├── optimizer.py             # Main workflow — Bronze, Silver & Gold
+├── test.py                  # Setup / smoke tests
+├── context/                 # AutoResearch reference files
+│   ├── autoresearch_kontext.md
+│   ├── program.md
+│   └── train.py
+├── prompts/                 # (Gold) LLM-editable variant files — timestamped per run
+│   └── 2026-03-11_0157_variants.json
+├── results/                 # Experiment results — one file per tier/run
 │   ├── results_bronze.json
 │   ├── results_silver.json
-│   └── results_gold.json
-└── .env                   # OPENAI_API_KEY
+│   └── 2026-03-11_0157_gold.json
+├── requirements.txt
+├── .env.example
+└── .gitignore
 ```
 
 ---
 
 ## ⚙️ Scoring System
 
-The scoring pipeline is the same for Bronze (manual) and Silver (LLM-as-judge):
+The scoring pipeline is the same across all tiers (Bronze → Silver → Gold):
 
 ```
 empathy:           1-10   (human or LLM)
@@ -110,14 +116,19 @@ OPENAI_API_KEY=sk-...
 ## ▶️ Usage
 
 ```bash
-# Silver — automated LLM scoring (default)
+# Gold — iterative optimization with LLM-generated variants (default)
 python optimizer.py
-
-# Bronze — manual human scoring
-# Change mode in optimizer.py: main(mode="manual")
 ```
 
-Results are saved to `results/results_bronze.json` or `results/results_silver.json`.
+To run earlier tiers, change the call at the bottom of `optimizer.py`:
+
+```python
+main(mode="manual")   # Bronze — manual human scoring
+main(mode="llm")      # Silver — automated LLM scoring
+main_gold()            # Gold   — iterative optimization loop
+```
+
+Gold creates timestamped output files so multiple runs don't overwrite each other.
 
 ---
 

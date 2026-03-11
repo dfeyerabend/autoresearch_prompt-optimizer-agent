@@ -9,6 +9,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = "gpt-4o-mini"
 MAX_TOKENS_BRONZE = 500
 MAX_TOKENS_SILVER = 200
+MAX_TOKENS_GOLD = 2000
 
 # The task we're optimizing
 TASK = "Write a professional customer service response to a complaint."

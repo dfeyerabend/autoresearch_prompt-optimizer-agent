@@ -1,19 +1,21 @@
 # optimizer.py
 import re
+import os
 import json
 from datetime import datetime
 
-from config import client, MODEL, MAX_TOKENS_BRONZE, MAX_TOKENS_SILVER, TASK, TEST_INPUT, CRITERIA, PROMPT_VARIANTS
+from config import client, MODEL, MAX_TOKENS_BRONZE, MAX_TOKENS_SILVER, MAX_TOKENS_GOLD, TASK, TEST_INPUT, CRITERIA, PROMPT_VARIANTS
 from scoring import calculate_final_score
 
 
 def run_prompt(variant: dict, task: str, input_text: str) -> str:
     """
     Runs a prompt and returns the response.
+    Uses .replace() instead of .format() — safe for LLM-generated templates
     Used to generate the test outputs
     """
 
-    user_message = variant["template"].format(task=task, input=input_text)
+    user_message = variant["template"].replace("{task}", task).replace("{input}", input_text)
 
     response = client.chat.completions.create(
         model=MODEL,
@@ -257,7 +259,205 @@ def main(mode="manual"):
 
     return results
 
+# =============================================================================
+# GOLD LEVEL CODE
+# =============================================================================
+
+def generate_new_variants(previous_results: list, num_variants: int = 3) -> list:
+    """
+    Analyzes previous results and generates new prompt variants.
+    This is the "mutation" step — like modifying train.py in AutoResearch.
+    """
+
+    # Format results so the LLM can see what worked and what didn't
+    results_summary = ""
+    for r in previous_results:
+        results_summary += f"""
+        Variant: {r['variant']}
+        System Prompt: {r.get('system_prompt', 'N/A')[:100]}...
+        Total Score: {r['total_score']}/10 (E:{r['empathy']} P:{r['professionalism']} C:{r['concreteness']})
+        Word Count: {r['word_count']} (Weight: {r['word_count_weight']})
+        Reasoning: {r.get('reasoning', 'N/A')}
+        ---
+        """
+
+    generation_prompt = f"""You are a prompt engineering expert. Analyze these experiment results and generate {num_variants} NEW, improved prompt variants.
+    
+    PREVIOUS RESULTS:
+    {results_summary}
+    
+    TASK BEING OPTIMIZED:
+    {TASK}
+    
+    SCORING: Each output is scored on empathy (1-10), professionalism (1-10), concreteness (1-10). The average is multiplied by a word count penalty (target: 150 words, Gaussian curve). Optimize for all three categories while keeping word count near 150.
+    
+    Based on the results:
+    1. What patterns work well?
+    2. What performs poorly?
+    3. What new approaches could score higher?
+    
+    Generate {num_variants} new variants in this exact JSON format, nothing else:
+    [
+        {{
+            "name": "variant_name",
+            "hypothesis": "Why this variant might score higher",
+            "system": "The system prompt",
+            "template": "The template with {{task}} and {{input}} placeholders"
+        }}
+    ]
+    """
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS_GOLD,
+        messages=[
+            {"role": "user", "content": generation_prompt}
+        ]
+    )
+
+    text = response.choices[0].message.content
+
+    # Extract JSON array from response
+    json_match = re.search(r'\[.*\]', text, re.DOTALL)
+    if json_match:
+        try:
+            variants = json.loads(json_match.group())
+            # Validate: each variant must have name, system, template
+            valid = [v for v in variants
+                     if all(k in v for k in ["name", "system", "template"])]
+            if valid:
+                return valid
+        except json.JSONDecodeError:
+            pass
+
+    print("  ⚠ Warning: Could not parse new variants from LLM response")
+    return []
+
+
+def iterative_optimization(initial_variants: list, num_iterations: int = 3, variants_file: str = "prompts/variants.json") -> dict:
+    """
+    Runs multiple iteration rounds.
+    Each round: load variants → test → analyze → generate new → save to file → repeat
+    Like AutoResearch: the agent only modifies the variants file, nothing else.
+    """
+
+    all_history = []
+    best_ever = {"total_score": 0, "variant": None}
+
+    # Write initial variants to the editable file (clean state)
+    os.makedirs(os.path.dirname(variants_file), exist_ok=True)
+    with open(variants_file, "w") as f:
+        json.dump(initial_variants, f, indent=2)
+    print(f"✓ Initial variants written to {variants_file}")
+
+    for iteration in range(num_iterations):
+        print(f"\n{'#' * 70}")
+        print(f"ITERATION {iteration + 1}/{num_iterations}")
+        print(f"{'#' * 70}")
+
+        # Load current variants from file (the "editable" file)
+        with open(variants_file, "r") as f:
+            current_variants = json.load(f)
+        print(f"Loaded {len(current_variants)} variants from {variants_file}")
+
+        # Test all variants using existing Silver pipeline
+        results = run_automated_experiment(
+            current_variants, TASK, TEST_INPUT, num_runs=1
+        )
+
+        all_history.extend(results)
+
+        # Find best in this iteration
+        best_this_round = max(results, key=lambda x: x["total_score"])
+        print(f"\nBest this round: {best_this_round['variant']} = "
+              f"{best_this_round['total_score']}/10")
+
+        # Update best ever
+        if best_this_round["total_score"] > best_ever["total_score"]:
+            best_ever = {
+                "total_score": best_this_round["total_score"],
+                "variant": best_this_round["variant"],
+                "iteration": iteration + 1,
+                "output": best_this_round["output"],
+                "system_prompt": best_this_round.get("system_prompt", ""),
+                "empathy": best_this_round["empathy"],
+                "professionalism": best_this_round["professionalism"],
+                "concreteness": best_this_round["concreteness"],
+            }
+            print(f"🆕 New best ever!")
+
+        # Generate new variants for next iteration (except last)
+        if iteration < num_iterations - 1:
+            print(f"\nGenerating new variants based on learnings...")
+            new_variants = generate_new_variants(results, num_variants=3)
+
+            if new_variants:
+                # Write new variants to file — this is the ONLY file the LLM changes
+                with open(variants_file, "w") as f:
+                    json.dump(new_variants, f, indent=2)
+                print(f"✓ {len(new_variants)} new variants written to {variants_file}")
+                for v in new_variants:
+                    print(f"  - {v['name']}: {v.get('hypothesis', '')[:60]}...")
+            else:
+                print("No new variants generated, keeping current file")
+
+    return {
+        "best_ever": best_ever,
+        "total_experiments": len(all_history),
+        "iterations": num_iterations,
+        "history": all_history
+    }
+
+def main_gold():
+    """Iterative optimization loop — the Gold challenge."""
+    # Timestamped output so multiple runs don't overwrite each other
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    save_path = f"results/{timestamp}_gold.json"
+    variants_file = f"prompts/{timestamp}_variants.json"
+
+    print("=" * 70)
+    print("PROMPT OPTIMIZER — GOLD (Iterative)")
+    print("=" * 70)
+
+    result = iterative_optimization(
+        PROMPT_VARIANTS,  # start fresh from config.py defaults
+        num_iterations=3,
+        variants_file=variants_file
+    )
+
+    # Display final results
+    print(f"\n{'=' * 70}")
+    print("FINAL RESULTS")
+    print(f"{'=' * 70}")
+    print(f"Total Experiments: {result['total_experiments']}")
+    print(f"Iterations: {result['iterations']}")
+    print(f"\n🏆 BEST PROMPT EVER:")
+    print(f"   Variant: {result['best_ever']['variant']}")
+    print(f"   Score: {result['best_ever']['total_score']}/10")
+    print(f"   Found in iteration: {result['best_ever']['iteration']}")
+    print(f"   (E:{result['best_ever']['empathy']} "
+          f"P:{result['best_ever']['professionalism']} "
+          f"C:{result['best_ever']['concreteness']})")
+    print(f"\n   System Prompt:")
+    print(f"   {result['best_ever'].get('system_prompt', 'N/A')}")
+
+    # Save everything
+    os.makedirs("results", exist_ok=True)
+    with open(save_path, "w") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    print(f"\n✓ Results saved to {save_path}")
+    print(f"✓ Final variants in {variants_file}")
+
+    return result
+
+
+
+# =============================================================================
+# RUN CODE
+# =============================================================================
 
 if __name__ == "__main__":
     # mode="manuel" = BRONZE, mode="llm" = SILVER
-    main(mode="llm")
+    #main(mode="llm")
+    main_gold()
